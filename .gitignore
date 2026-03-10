@@ -1,0 +1,23 @@
+# python
+__pycache__/
+*.pyc
+
+# virtualenv
+venv/
+
+# logs
+*.log
+
+# datos procesados
+curado_2026/
+historico_2026/
+rechazados_2026/
+
+# outputs
+procesados.json
+metadata_facturas_2026.csv
+facturas_metadata.json
+
+
+.env
+.env.*
