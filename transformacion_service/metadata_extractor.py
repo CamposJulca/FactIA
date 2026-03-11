@@ -444,8 +444,12 @@ class InvoiceMetadataExtractor:
 
                     filename = att.get("filename")
 
-                    if filename:
-                        fechas[filename] = fecha
+                    if filename and fecha:
+                        # Conservar la fecha MÁS TEMPRANA si el mismo ZIP
+                        # aparece en varios correos (reenvíos, copias, etc.)
+                        existing = fechas.get(filename)
+                        if existing is None or fecha < existing:
+                            fechas[filename] = fecha
 
             logging.info(f"Correos indexados: {len(fechas)}")
 
@@ -622,16 +626,18 @@ class InvoiceMetadataExtractor:
     # IVA FACTURADO
     # ==========================================================
     def _extract_iva(self, root):
-
+        """
+        Suma solo los TaxAmount de nivel raíz del Invoice.
+        Usar './/cac:TaxTotal' incluiría también los TaxAmount por
+        InvoiceLine, duplicando el valor cuando hay una sola línea.
+        """
         total = Decimal("0")
 
         for tax in root.findall(
-            ".//cac:TaxTotal/cbc:TaxAmount",
+            "cac:TaxTotal/cbc:TaxAmount",
             self.namespaces
         ):
-
             if tax.text:
-
                 try:
                     total += Decimal(tax.text)
                 except Exception:
@@ -655,21 +661,25 @@ class InvoiceMetadataExtractor:
         return None
     
     # ==========================================================
-    # VALOR DE LA FACTURA
+    # VALOR DE LA FACTURA (subtotal sin IVA)
     # ==========================================================
     def _extract_valor_factura(self, root):
-
-        payable = root.find(
-            ".//cac:LegalMonetaryTotal/cbc:PayableAmount",
-            self.namespaces
-        )
-
-        if payable is not None and payable.text:
-
-            try:
-                return str(Decimal(payable.text.strip()))
-            except Exception:
-                return None
+        """
+        Extrae el subtotal antes de impuestos.
+        UBL: TaxExclusiveAmount = monto gravable sin IVA.
+        Fallback a LineExtensionAmount si no existe.
+        NO usar PayableAmount (ese incluye IVA = subtotal + IVA).
+        """
+        for campo in (
+            ".//cac:LegalMonetaryTotal/cbc:TaxExclusiveAmount",
+            ".//cac:LegalMonetaryTotal/cbc:LineExtensionAmount",
+        ):
+            elem = root.find(campo, self.namespaces)
+            if elem is not None and elem.text:
+                try:
+                    return str(Decimal(elem.text.strip()))
+                except Exception:
+                    continue
 
         return None
 
