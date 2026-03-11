@@ -13,7 +13,7 @@ def get_access_token():
         "grant_type": "client_credentials"
     }
 
-    response = requests.post(token_url, data=data, verify=certifi.where())
+    response = requests.post(token_url, data=data, verify=certifi.where(), timeout=(10, 15))
 
     if response.status_code != 200:
         raise Exception("Error obteniendo token")
