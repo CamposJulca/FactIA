@@ -29,6 +29,7 @@ from transformacion_service.metadata_extractor import InvoiceMetadataExtractor
 CURATED_FOLDER  = 'curado_2026/facturas'
 PROCESADOS_FILE = os.path.join(DATA_DIR, 'procesados.json')
 FACTURAS_FILE   = os.path.join(DATA_DIR, 'facturas_metadata.json')
+CRON_LOG_FILE   = os.path.join(DATA_DIR, 'cron_log.json')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 log = logging.getLogger('factia')
@@ -291,6 +292,233 @@ def stats():
             'fecha_max':      fecha_max_zip,
             'por_mes':        por_mes,
         })
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/descargar-carpetas/', methods=['GET'])
+def descargar_carpetas():
+    """
+    GET /api/descargar-carpetas/?actualizar=1
+    Extrae todos los ZIPs del histórico a carpetas y sirve un ZIP descargable.
+    - Sin parámetros: sirve el ZIP cacheado si existe y está actualizado.
+    - ?actualizar=1: re-extrae todos los ZIPs nuevos y regenera el ZIP.
+    """
+    import glob, zipfile as _zipfile, tempfile
+    from flask import send_file
+
+    HISTORICO    = os.path.join(DATA_DIR, 'historico_2026')
+    EXTRAIDOS    = os.path.join(DATA_DIR, 'extraidos')
+    ZIP_CACHE    = os.path.join(DATA_DIR, 'FacturasElectronicas.zip')
+    actualizar   = request.args.get('actualizar', '0') == '1'
+
+    os.makedirs(EXTRAIDOS, exist_ok=True)
+
+    # ── Extraer ZIPs nuevos o todos si se pide actualización ─────────────────
+    zips = sorted(glob.glob(f'{HISTORICO}/**/*.zip', recursive=True))
+    ok = skip = err = 0
+    for zip_path in zips:
+        rel     = os.path.relpath(os.path.dirname(zip_path), HISTORICO)
+        nombre  = os.path.splitext(os.path.basename(zip_path))[0]
+        dest    = os.path.join(EXTRAIDOS, rel, nombre)
+        if not actualizar and os.path.exists(dest) and os.listdir(dest):
+            skip += 1
+            continue
+        os.makedirs(dest, exist_ok=True)
+        try:
+            with _zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(dest)
+            ok += 1
+        except Exception as exc:
+            log.warning(f'Error extrayendo {zip_path}: {exc}')
+            err += 1
+
+    log.info(f'Extracción: {ok} nuevos | {skip} ya existían | {err} errores')
+
+    # ── Regenerar ZIP cacheado si hubo cambios o se pidió actualización ───────
+    if ok > 0 or actualizar or not os.path.exists(ZIP_CACHE):
+        log.info('Generando FacturasElectronicas.zip...')
+        tmp_path = ZIP_CACHE + '.tmp'
+        with _zipfile.ZipFile(tmp_path, 'w', _zipfile.ZIP_DEFLATED) as zout:
+            for root, dirs, files in os.walk(EXTRAIDOS):
+                for fname in files:
+                    fpath   = os.path.join(root, fname)
+                    arcname = os.path.relpath(fpath, EXTRAIDOS)
+                    zout.write(fpath, arcname)
+        os.replace(tmp_path, ZIP_CACHE)
+        log.info(f'ZIP generado: {os.path.getsize(ZIP_CACHE) // (1024*1024)} MB')
+
+    return send_file(
+        ZIP_CACHE,
+        mimetype='application/zip',
+        as_attachment=True,
+        download_name='FacturasElectronicas.zip',
+    )
+
+
+@app.route('/api/descargar-carpetas/info/', methods=['GET'])
+def descargar_carpetas_info():
+    """
+    GET /api/descargar-carpetas/info/
+    Retorna metadatos del ZIP cacheado sin descargarlo.
+    """
+    import glob
+    HISTORICO = os.path.join(DATA_DIR, 'historico_2026')
+    EXTRAIDOS = os.path.join(DATA_DIR, 'extraidos')
+    ZIP_CACHE = os.path.join(DATA_DIR, 'FacturasElectronicas.zip')
+
+    total_zips     = len(glob.glob(f'{HISTORICO}/**/*.zip', recursive=True))
+    total_carpetas = sum(1 for d in os.scandir(EXTRAIDOS) if d.is_dir()) if os.path.exists(EXTRAIDOS) else 0
+    zip_info       = {}
+    if os.path.exists(ZIP_CACHE):
+        st = os.stat(ZIP_CACHE)
+        zip_info = {
+            'size_mb':   round(st.st_size / (1024 * 1024), 1),
+            'generado':  __import__('datetime').datetime.fromtimestamp(st.st_mtime).isoformat(),
+        }
+
+    return jsonify({
+        'total_zips':     total_zips,
+        'total_carpetas': total_carpetas,
+        'cache':          zip_info,
+    })
+
+
+@app.route('/api/semanas/', methods=['GET'])
+def listar_semanas():
+    """
+    GET /api/semanas/
+    Retorna la lista de semanas disponibles en el histórico con conteo de ZIPs y PDFs.
+    """
+    import glob as _glob
+    HISTORICO = os.path.join(DATA_DIR, 'historico_2026')
+    semanas = {}
+    for zip_path in _glob.glob(f'{HISTORICO}/**/*.zip', recursive=True):
+        rel = os.path.relpath(zip_path, HISTORICO)
+        parts = rel.replace('\\', '/').split('/')
+        if len(parts) >= 3:
+            key = '/'.join(parts[:3])   # e.g. "2026/03_march/semana_11"
+            semanas.setdefault(key, 0)
+            semanas[key] += 1
+
+    result = []
+    for key in sorted(semanas):
+        parts = key.split('/')
+        result.append({
+            'key':   key,
+            'year':  parts[0],
+            'mes':   parts[1],
+            'semana': parts[2],
+            'total_zips': semanas[key],
+        })
+    return jsonify({'semanas': result})
+
+
+@app.route('/api/descargar-pdfs/', methods=['GET'])
+def descargar_pdfs():
+    """
+    GET /api/descargar-pdfs/?semana=2026/01_january/semana_01
+    Extrae solo los PDFs de los ZIPs de la semana indicada,
+    los renombra como {fecha_emision}_{nit}_{num_factura}.pdf
+    y devuelve un ZIP descargable con ellos.
+    Si no hay metadata para un PDF, conserva el nombre original.
+    """
+    import glob as _glob, zipfile as _zipfile, io, re
+
+    semana = request.args.get('semana', '').strip().strip('/')
+    if not semana or semana.count('/') != 2:
+        return jsonify({'error': 'Parámetro semana inválido. Formato: 2026/01_january/semana_01'}), 400
+
+    HISTORICO = os.path.join(DATA_DIR, 'historico_2026')
+    semana_dir = os.path.join(HISTORICO, semana)
+    if not os.path.isdir(semana_dir):
+        return jsonify({'error': f'Semana no encontrada: {semana}'}), 404
+
+    # Construir índice metadata: nombre_zip → factura
+    # archivo field: "curado_2026/facturas/2026/03_march/semana_11/zXXX/adXXX.xml"
+    meta_index = {}
+    if os.path.exists(FACTURAS_FILE):
+        with open(FACTURAS_FILE, 'r', encoding='utf-8') as f:
+            for factura in json.load(f):
+                archivo = factura.get('archivo', '').replace('\\', '/')
+                # carpeta del ZIP = penúltimo segmento del path del xml
+                partes = archivo.split('/')
+                if len(partes) >= 2:
+                    nombre_carpeta = partes[-2]   # e.g. "z08305152940102601054611"
+                    meta_index[nombre_carpeta] = factura
+
+    zips = sorted(_glob.glob(os.path.join(semana_dir, '*.zip')))
+    if not zips:
+        return jsonify({'error': f'No hay ZIPs en la semana {semana}'}), 404
+
+    buf = io.BytesIO()
+    agregados = 0
+    with _zipfile.ZipFile(buf, 'w', _zipfile.ZIP_DEFLATED) as zout:
+        for zip_path in zips:
+            zip_stem = os.path.splitext(os.path.basename(zip_path))[0]  # e.g. "z08305152940102601054611"
+            try:
+                with _zipfile.ZipFile(zip_path, 'r') as zin:
+                    pdfs = [n for n in zin.namelist() if n.lower().endswith('.pdf')]
+                    if not pdfs:
+                        continue
+                    pdf_name_orig = pdfs[0]
+                    pdf_data = zin.read(pdf_name_orig)
+
+                    # Solo incluir PDFs que tengan metadata (= facturas electrónicas)
+                    # Los que no tienen metadata son notas de crédito u otros documentos
+                    meta = meta_index.get(zip_stem)
+                    if not meta:
+                        continue
+
+                    fecha = meta.get('fecha_emision') or 'sin_fecha'
+                    nit   = re.sub(r'[^\w]', '_', str(meta.get('proveedor_nit', 'nit')))
+                    num   = re.sub(r'[^\w\-]', '_', str(meta.get('numero_factura', '0')))
+                    nombre_final = f"{fecha}_{nit}_{num}.pdf"
+
+                    zout.writestr(nombre_final, pdf_data)
+                    agregados += 1
+            except Exception as exc:
+                log.warning(f'Error procesando {zip_path}: {exc}')
+
+    buf.seek(0)
+    semana_label = semana.replace('/', '_')
+    return Response(
+        buf.read(),
+        mimetype='application/zip',
+        headers={
+            'Content-Disposition': f'attachment; filename="PDFs_{semana_label}.zip"',
+            'X-Total-PDFs': str(agregados),
+        },
+    )
+
+
+@app.route('/api/cron-log/', methods=['GET'])
+def get_cron_log():
+    """Retorna el historial de ejecuciones programadas."""
+    try:
+        if not os.path.exists(CRON_LOG_FILE):
+            return jsonify({'runs': []})
+        with open(CRON_LOG_FILE, 'r', encoding='utf-8') as f:
+            return jsonify(json.load(f))
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/cron-log/', methods=['POST'])
+def post_cron_log():
+    """Registra el resultado de una ejecución programada."""
+    try:
+        body = request.get_json(silent=True) or {}
+        data = {}
+        if os.path.exists(CRON_LOG_FILE):
+            with open(CRON_LOG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        runs = data.get('runs', [])
+        runs.insert(0, body)
+        runs = runs[:50]  # conservar últimas 50 ejecuciones
+        with open(CRON_LOG_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'runs': runs}, f, ensure_ascii=False)
+        return jsonify({'ok': True})
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 

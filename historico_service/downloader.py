@@ -1,6 +1,8 @@
+import os
 import time
 from .control import load_processed, save_processed
 from .storage import build_path
+from .extractor import extraer_zip
 
 # Pausa entre páginas para no saturar la API
 DELAY_ENTRE_PAGINAS = 0.5   # segundos
@@ -9,10 +11,13 @@ DELAY_ENTRE_PAGINAS = 0.5   # segundos
 class Downloader:
 
     def __init__(self, graph_client, logger, abort_event=None):
-        self.graph       = graph_client
-        self.logger      = logger
-        self.processed   = load_processed()
-        self.abort_event = abort_event
+        self.graph        = graph_client
+        self.logger       = logger
+        self.processed    = load_processed()
+        self.abort_event  = abort_event
+        # Carpeta donde se extraen los ZIPs (env var o default junto a DATA_DIR)
+        data_dir = os.getenv('FACTIA_DATA_DIR', '/data/factia')
+        self.extraidos_dir = os.path.join(data_dir, 'extraidos')
 
     def run(self):
 
@@ -94,6 +99,12 @@ class Downloader:
                                 message_id, att["id"], file_path
                             )
                             self.logger.info(f"Descargado: {filename} ({size_kb} KB)")
+
+                            # Extraer ZIP a carpeta local
+                            dest = extraer_zip(file_path, self.extraidos_dir)
+                            if dest:
+                                self.logger.info(f"Extraído en: {dest}")
+
                             attachments_data.append({
                                 "filename":     filename,
                                 "storage_path": path,
