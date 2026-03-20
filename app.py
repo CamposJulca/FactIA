@@ -9,8 +9,13 @@ import logging
 import threading
 import queue as _queue
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 
+import requests as _reqs
 from flask import Flask, jsonify, request, Response, stream_with_context
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import pytz
 
 # Directorio de datos persistentes (montado como volumen en Docker)
 DATA_DIR = os.getenv('FACTIA_DATA_DIR', '/data/factia')
@@ -284,13 +289,22 @@ def stats():
             for m in all_meses
         ]
 
+        total_facturas_extraidas = 0
+        if os.path.exists(FACTURAS_FILE):
+            try:
+                with open(FACTURAS_FILE, 'r', encoding='utf-8') as fmeta:
+                    total_facturas_extraidas = len(json.load(fmeta))
+            except Exception:
+                pass
+
         return jsonify({
-            'total_mensajes': len(procesados),
-            'total_con_zip':  sum(por_mes_correos.values()),
-            'total_zips':     total_zips,
-            'fecha_min':      fecha_min_zip,
-            'fecha_max':      fecha_max_zip,
-            'por_mes':        por_mes,
+            'total_mensajes':          len(procesados),
+            'total_con_zip':           sum(por_mes_correos.values()),
+            'total_zips':              total_zips,
+            'total_facturas_extraidas': total_facturas_extraidas,
+            'fecha_min':               fecha_min_zip,
+            'fecha_max':               fecha_max_zip,
+            'por_mes':                 por_mes,
         })
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
@@ -388,28 +402,59 @@ def descargar_carpetas_info():
 def listar_semanas():
     """
     GET /api/semanas/
-    Retorna la lista de semanas disponibles en el histórico con conteo de ZIPs y PDFs.
+    Retorna la lista de semanas disponibles en el histórico.
+    - total_zips : ZIPs crudos descargados del buzón
+    - total_pdfs : PDFs en extraidos/ (todos los extraídos, incluyendo notas crédito, etc.)
+                   Se sincronizan ZIPs faltantes antes de contar.
     """
-    import glob as _glob
+    import glob as _glob, zipfile as _zipfile
     HISTORICO = os.path.join(DATA_DIR, 'historico_2026')
-    semanas = {}
+    EXTRAIDOS = os.path.join(DATA_DIR, 'extraidos')
+
+    semanas_zips = {}
+
     for zip_path in _glob.glob(f'{HISTORICO}/**/*.zip', recursive=True):
-        rel = os.path.relpath(zip_path, HISTORICO)
+        rel   = os.path.relpath(zip_path, HISTORICO)
         parts = rel.replace('\\', '/').split('/')
         if len(parts) >= 3:
-            key = '/'.join(parts[:3])   # e.g. "2026/03_march/semana_11"
-            semanas.setdefault(key, 0)
-            semanas[key] += 1
+            key = '/'.join(parts[:3])
+            semanas_zips[key] = semanas_zips.get(key, 0) + 1
 
+            # Extraer al vuelo si la carpeta del ZIP no existe aún en extraidos/
+            zip_stem = os.path.splitext(parts[-1])[0]
+            dest = os.path.join(EXTRAIDOS, key, zip_stem)
+            if not os.path.exists(dest) or not os.listdir(dest):
+                os.makedirs(dest, exist_ok=True)
+                try:
+                    with _zipfile.ZipFile(zip_path, 'r') as zf:
+                        zf.extractall(dest)
+                except Exception as exc:
+                    log.warning(f'listar_semanas: error extrayendo {zip_path}: {exc}')
+
+    # Contar PDFs por semana desde extraidos/ (ya sincronizado)
+    semanas_pdfs = {}
+    if os.path.exists(EXTRAIDOS):
+        for root, dirs, files in os.walk(EXTRAIDOS):
+            pdfs = sum(1 for f in files if f.lower().endswith('.pdf'))
+            if not pdfs:
+                continue
+            rel   = os.path.relpath(root, EXTRAIDOS)
+            parts = rel.replace('\\', '/').split('/')
+            if len(parts) >= 3:
+                key = '/'.join(parts[:3])
+                semanas_pdfs[key] = semanas_pdfs.get(key, 0) + pdfs
+
+    all_keys = sorted(set(list(semanas_zips.keys()) + list(semanas_pdfs.keys())))
     result = []
-    for key in sorted(semanas):
+    for key in all_keys:
         parts = key.split('/')
         result.append({
-            'key':   key,
-            'year':  parts[0],
-            'mes':   parts[1],
-            'semana': parts[2],
-            'total_zips': semanas[key],
+            'key':        key,
+            'year':       parts[0],
+            'mes':        parts[1],
+            'semana':     parts[2],
+            'total_zips': semanas_zips.get(key, 0),
+            'total_pdfs': semanas_pdfs.get(key, 0),
         })
     return jsonify({'semanas': result})
 
@@ -418,10 +463,10 @@ def listar_semanas():
 def descargar_pdfs():
     """
     GET /api/descargar-pdfs/?semana=2026/01_january/semana_01
-    Extrae solo los PDFs de los ZIPs de la semana indicada,
-    los renombra como {fecha_emision}_{nit}_{num_factura}.pdf
-    y devuelve un ZIP descargable con ellos.
-    Si no hay metadata para un PDF, conserva el nombre original.
+    Sirve todos los PDFs de extraidos/ para la semana indicada.
+    Sincroniza ZIPs faltantes antes de servir para garantizar consistencia.
+    PDFs con metadata se renombran {fecha_emision}_{nit}_{num}.pdf; los demás
+    conservan el nombre original.
     """
     import glob as _glob, zipfile as _zipfile, io, re
 
@@ -429,56 +474,73 @@ def descargar_pdfs():
     if not semana or semana.count('/') != 2:
         return jsonify({'error': 'Parámetro semana inválido. Formato: 2026/01_january/semana_01'}), 400
 
-    HISTORICO = os.path.join(DATA_DIR, 'historico_2026')
-    semana_dir = os.path.join(HISTORICO, semana)
-    if not os.path.isdir(semana_dir):
+    HISTORICO  = os.path.join(DATA_DIR, 'historico_2026')
+    EXTRAIDOS  = os.path.join(DATA_DIR, 'extraidos')
+    semana_dir = os.path.join(EXTRAIDOS, semana)
+    semana_src = os.path.join(HISTORICO, semana)
+
+    if not os.path.isdir(semana_src):
         return jsonify({'error': f'Semana no encontrada: {semana}'}), 404
 
-    # Construir índice metadata: nombre_zip → factura
-    # archivo field: "curado_2026/facturas/2026/03_march/semana_11/zXXX/adXXX.xml"
+    # Sincronizar: extraer cualquier ZIP que aún no tenga carpeta en extraidos/
+    for zip_path in sorted(_glob.glob(os.path.join(semana_src, '*.zip'))):
+        zip_stem = os.path.splitext(os.path.basename(zip_path))[0]
+        dest = os.path.join(semana_dir, zip_stem)
+        if not os.path.exists(dest) or not os.listdir(dest):
+            os.makedirs(dest, exist_ok=True)
+            try:
+                with _zipfile.ZipFile(zip_path, 'r') as zf:
+                    zf.extractall(dest)
+            except Exception as exc:
+                log.warning(f'descargar_pdfs: error extrayendo {zip_path}: {exc}')
+
+    if not os.path.isdir(semana_dir):
+        return jsonify({'error': f'No se pudo preparar la semana: {semana}'}), 500
+
+    # Construir índice metadata: nombre_carpeta_zip → factura
     meta_index = {}
     if os.path.exists(FACTURAS_FILE):
         with open(FACTURAS_FILE, 'r', encoding='utf-8') as f:
             for factura in json.load(f):
                 archivo = factura.get('archivo', '').replace('\\', '/')
-                # carpeta del ZIP = penúltimo segmento del path del xml
-                partes = archivo.split('/')
+                partes  = archivo.split('/')
                 if len(partes) >= 2:
-                    nombre_carpeta = partes[-2]   # e.g. "z08305152940102601054611"
-                    meta_index[nombre_carpeta] = factura
-
-    zips = sorted(_glob.glob(os.path.join(semana_dir, '*.zip')))
-    if not zips:
-        return jsonify({'error': f'No hay ZIPs en la semana {semana}'}), 404
+                    meta_index[partes[-2]] = factura
 
     buf = io.BytesIO()
     agregados = 0
+    nombres_usados = set()
     with _zipfile.ZipFile(buf, 'w', _zipfile.ZIP_DEFLATED) as zout:
-        for zip_path in zips:
-            zip_stem = os.path.splitext(os.path.basename(zip_path))[0]  # e.g. "z08305152940102601054611"
-            try:
-                with _zipfile.ZipFile(zip_path, 'r') as zin:
-                    pdfs = [n for n in zin.namelist() if n.lower().endswith('.pdf')]
-                    if not pdfs:
+        for entry in sorted(os.scandir(semana_dir), key=lambda e: e.name):
+            if not entry.is_dir():
+                continue
+            zip_stem = entry.name
+            meta     = meta_index.get(zip_stem)
+            # Buscar PDFs recursivamente dentro de la carpeta del ZIP
+            for root, dirs, files in os.walk(entry.path):
+                for fname in sorted(files):
+                    if not fname.lower().endswith('.pdf'):
                         continue
-                    pdf_name_orig = pdfs[0]
-                    pdf_data = zin.read(pdf_name_orig)
-
-                    # Solo incluir PDFs que tengan metadata (= facturas electrónicas)
-                    # Los que no tienen metadata son notas de crédito u otros documentos
-                    meta = meta_index.get(zip_stem)
-                    if not meta:
-                        continue
-
-                    fecha = meta.get('fecha_emision') or 'sin_fecha'
-                    nit   = re.sub(r'[^\w]', '_', str(meta.get('proveedor_nit', 'nit')))
-                    num   = re.sub(r'[^\w\-]', '_', str(meta.get('numero_factura', '0')))
-                    nombre_final = f"{fecha}_{nit}_{num}.pdf"
-
-                    zout.writestr(nombre_final, pdf_data)
+                    pdf_path = os.path.join(root, fname)
+                    with open(pdf_path, 'rb') as pf:
+                        pdf_data = pf.read()
+                    if meta:
+                        fecha = meta.get('fecha_emision') or 'sin_fecha'
+                        nit   = re.sub(r'[^\w]', '_', str(meta.get('proveedor_nit', 'nit')))
+                        num   = re.sub(r'[^\w\-]', '_', str(meta.get('numero_factura', '0')))
+                        nombre_final = f"{fecha}_{nit}_{num}.pdf"
+                    else:
+                        nombre_final = fname
+                    # Evitar colisiones de nombre en el ZIP
+                    base, ext = os.path.splitext(nombre_final)
+                    candidato = nombre_final
+                    contador  = 1
+                    while candidato in nombres_usados:
+                        candidato = f"{base}_{contador}{ext}"
+                        contador += 1
+                    nombres_usados.add(candidato)
+                    zout.writestr(candidato, pdf_data)
                     agregados += 1
-            except Exception as exc:
-                log.warning(f'Error procesando {zip_path}: {exc}')
 
     buf.seek(0)
     semana_label = semana.replace('/', '_')
@@ -509,23 +571,135 @@ def post_cron_log():
     """Registra el resultado de una ejecución programada."""
     try:
         body = request.get_json(silent=True) or {}
-        data = {}
-        if os.path.exists(CRON_LOG_FILE):
-            with open(CRON_LOG_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        runs = data.get('runs', [])
-        runs.insert(0, body)
-        runs = runs[:50]  # conservar últimas 50 ejecuciones
-        with open(CRON_LOG_FILE, 'w', encoding='utf-8') as f:
-            json.dump({'runs': runs}, f, ensure_ascii=False)
+        _write_cron_log(body)
         return jsonify({'ok': True})
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
 
 
+@app.route('/api/descargar-exe/', methods=['GET'])
+def descargar_exe():
+    """Sirve SincronizarFacturas.exe si fue compilado con build.sh."""
+    from flask import send_file, abort
+    exe_path = os.path.join(DATA_DIR, 'SincronizarFacturas.exe')
+    if not os.path.isfile(exe_path):
+        abort(404)
+    return send_file(
+        exe_path,
+        as_attachment=True,
+        download_name='SincronizarFacturas.exe',
+        mimetype='application/octet-stream',
+    )
+
+
 @app.route('/api/health/', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'})
+
+
+# ── Helper cron log ───────────────────────────────────────────────────────────
+
+def _write_cron_log(entry: dict):
+    """Inserta una entrada al historial de cron, conservando las últimas 50."""
+    data = {}
+    if os.path.exists(CRON_LOG_FILE):
+        try:
+            with open(CRON_LOG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    runs = data.get('runs', [])
+    runs.insert(0, entry)
+    runs = runs[:50]
+    with open(CRON_LOG_FILE, 'w', encoding='utf-8') as f:
+        json.dump({'runs': runs}, f, ensure_ascii=False)
+
+
+# ── Cron automático ───────────────────────────────────────────────────────────
+
+BOGOTA_TZ = pytz.timezone('America/Bogota')
+
+def _run_cron_slot(hora_slot: str):
+    """
+    Ejecuta el pipeline completo para el slot horario indicado.
+    Calcula el rango de fechas en UTC (Colombia = UTC-5, sin DST).
+    Slots:
+        06:00  → 4 PM ayer - 6 AM hoy  (UTC: ayer 21:00 - hoy 11:00)
+        11:00  → 6 AM hoy - 11 AM hoy  (UTC: hoy 11:00 - hoy 16:00)
+        16:00  → 11 AM hoy - 4 PM hoy  (UTC: hoy 16:00 - hoy 21:00)
+    """
+    log.info(f'[CRON] Iniciando slot {hora_slot}')
+    now_utc  = datetime.now(timezone.utc)
+    today    = now_utc.date()
+    yesterday = today - timedelta(days=1)
+
+    if hora_slot == '06:00':
+        f_desde = f'{yesterday}T21:00:00Z'
+        f_hasta = f'{today}T11:00:00Z'
+    elif hora_slot == '11:00':
+        f_desde = f'{today}T11:00:00Z'
+        f_hasta = f'{today}T16:00:00Z'
+    else:  # 16:00
+        f_desde = f'{today}T16:00:00Z'
+        f_hasta = f'{today}T21:00:00Z'
+
+    status_final   = 'error'
+    mensajes_proc  = 0
+    facturas_guard = 0
+    errores        = 0
+
+    try:
+        # Paso 1 — Descargar correos del rango
+        res_desc = _historico_con_conteo(fecha_desde=f_desde, fecha_hasta=f_hasta)
+        mensajes_proc = res_desc.get('mensajes_procesados', 0)
+        log.info(f'[CRON {hora_slot}] Descarga OK — {mensajes_proc} mensajes totales')
+
+        # Paso 2 — Clasificar y extraer metadata
+        res_proc = _procesar_completo()
+        errores  = res_proc.get('errores', 0)
+        log.info(f'[CRON {hora_slot}] Procesamiento OK — {res_proc.get("total", 0)} facturas, {errores} errores')
+
+        # Paso 3 — Sincronizar con Django DB
+        backend_url  = os.getenv('BACKEND_URL', 'http://backend:8000')
+        cron_token   = os.getenv('CRON_INTERNAL_TOKEN', '')
+        if cron_token:
+            sync_resp = _reqs.post(
+                f'{backend_url}/api/facturacion/sincronizar-cron/',
+                headers={'X-Cron-Token': cron_token},
+                timeout=120,
+            )
+            if sync_resp.status_code == 200:
+                facturas_guard = sync_resp.json().get('total', 0)
+                log.info(f'[CRON {hora_slot}] Sync DB OK — {facturas_guard} facturas guardadas')
+                status_final = 'ok'
+            else:
+                log.error(f'[CRON {hora_slot}] Sync DB error {sync_resp.status_code}')
+        else:
+            log.warning(f'[CRON {hora_slot}] CRON_INTERNAL_TOKEN no configurado — omitiendo sync DB')
+            status_final = 'ok'
+
+    except Exception as exc:
+        log.error(f'[CRON {hora_slot}] Fallo: {exc}')
+
+    _write_cron_log({
+        'timestamp':         datetime.now().isoformat(),
+        'status':            status_final,
+        'hora_slot':         hora_slot,
+        'mensajes_procesados': mensajes_proc,
+        'facturas_guardadas':  facturas_guard,
+        'errores':           errores,
+        'rango':             f'{f_desde} → {f_hasta}',
+    })
+    log.info(f'[CRON {hora_slot}] Finalizado con status={status_final}')
+
+
+# Iniciar scheduler (solo en proceso principal, no en reloader de Flask)
+_scheduler = BackgroundScheduler(timezone=BOGOTA_TZ)
+_scheduler.add_job(lambda: _run_cron_slot('06:00'), CronTrigger(hour=6,  minute=0, timezone=BOGOTA_TZ))
+_scheduler.add_job(lambda: _run_cron_slot('11:00'), CronTrigger(hour=11, minute=0, timezone=BOGOTA_TZ))
+_scheduler.add_job(lambda: _run_cron_slot('16:00'), CronTrigger(hour=16, minute=0, timezone=BOGOTA_TZ))
+_scheduler.start()
+log.info('[CRON] Scheduler iniciado — slots 06:00 | 11:00 | 16:00 (Bogotá)')
 
 
 if __name__ == '__main__':

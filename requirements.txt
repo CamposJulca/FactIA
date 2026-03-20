@@ -3,3 +3,5 @@ gunicorn>=21.2
 requests>=2.31
 certifi
 python-dotenv>=1.0
+APScheduler>=3.10
+pytz>=2023.3
