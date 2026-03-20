@@ -21,3 +21,24 @@ facturas_metadata.json
 
 .env
 .env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Ejecutables
+*.exe
+
+# Entornos
+.venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
