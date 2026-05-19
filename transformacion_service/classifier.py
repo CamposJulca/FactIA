@@ -190,8 +190,13 @@ class ZipClassifier:
 
         os.makedirs(destino, exist_ok=True)
 
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(destino)
+        try:
+            with zipfile.ZipFile(zip_path, "r") as z:
+                z.extractall(destino)
+        except zipfile.BadZipFile:
+            # ZIP corrupto/truncado: ya quedó contado en InvalidXML.
+            # No abortar el cron por uno solo (el original re-abría aquí sin try).
+            pass
 
     # ==========================================================
     # RESUMEN FINAL
