@@ -16,12 +16,19 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-# ─── Configuración por defecto ────────────────────────────────────────────────
+# python-dotenv — opcional: carga .env si está instalado
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass
+
+# ─── Configuración por defecto (desde entorno) ────────────────────────────────
 DEFAULT_CONFIG = {
-    "BASE_URL":  "https://facturacion-electronica.ngrok.io",
-    "USUARIO":   "admin",
-    "PASSWORD":  "Finagro2026!",
-    "DESTINO":   r"C:\Users\cdcampos\Documents\FacturasElectronicas",
+    "BASE_URL":  os.environ.get("PORTAL_BASE_URL", ""),
+    "USUARIO":   os.environ.get("PORTAL_USER", ""),
+    "PASSWORD":  os.environ.get("PORTAL_PASS", ""),
+    "DESTINO":   os.environ.get("PORTAL_DESTINO", ""),
 }
 STATE_FILE = Path.home() / ".sincronizar_facturas_state.json"
 
@@ -76,7 +83,10 @@ class SincronizadorApp(tk.Tk):
                 data = json.loads(STATE_FILE.read_text())
                 self.last_sync = data.get("last_sync")
                 saved_cfg = data.get("config", {})
-                self.config.update(saved_cfg)
+                # Solo persistimos preferencias no sensibles
+                for k in ("BASE_URL", "DESTINO"):
+                    if k in saved_cfg:
+                        self.config[k] = saved_cfg[k]
             except Exception:
                 self.last_sync = None
         else:
@@ -87,8 +97,6 @@ class SincronizadorApp(tk.Tk):
             "last_sync": self.last_sync,
             "config": {
                 "BASE_URL": self.var_url.get(),
-                "USUARIO":  self.var_user.get(),
-                "PASSWORD": self.var_pass.get(),
                 "DESTINO":  self.var_dest.get(),
             }
         }

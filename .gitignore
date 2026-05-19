@@ -21,6 +21,7 @@ facturas_metadata.json
 
 .env
 .env.*
+!.env.example
 
 # Python
 __pycache__/

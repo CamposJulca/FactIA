@@ -16,12 +16,31 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
-# ─── Configuración por defecto ────────────────────────────────────────────────
+# python-dotenv — opcional: carga .env si está instalado
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass
+
+# Playwright — opcional: solo se importa si está instalado
+try:
+    from playwright.sync_api import sync_playwright
+    _PLAYWRIGHT_OK = True
+except ImportError:
+    _PLAYWRIGHT_OK = False
+
+# ─── Credenciales Mercurio (desde entorno) ────────────────────────────────────
+MERCURIO_URL    = "https://mercurio.finagro.com.co/mercurio"
+MERCURIO_USUARIO = os.environ.get("MERCURIO_USER", "")
+MERCURIO_CLAVE   = os.environ.get("MERCURIO_PASS", "")
+
+# ─── Configuración por defecto (desde entorno) ────────────────────────────────
 DEFAULT_CONFIG = {
-    "BASE_URL":  "https://facturacion-electronica.ngrok.io",
-    "USUARIO":   "admin",
-    "PASSWORD":  "Finagro2026!",
-    "DESTINO":   r"C:\Users\cdcampos\Documents\FacturasElectronicas",
+    "BASE_URL":  os.environ.get("PORTAL_BASE_URL", ""),
+    "USUARIO":   os.environ.get("PORTAL_USER", ""),
+    "PASSWORD":  os.environ.get("PORTAL_PASS", ""),
+    "DESTINO":   os.environ.get("PORTAL_DESTINO", ""),
 }
 STATE_FILE = Path.home() / ".sincronizar_facturas_state.json"
 
@@ -76,7 +95,10 @@ class SincronizadorApp(tk.Tk):
                 data = json.loads(STATE_FILE.read_text())
                 self.last_sync = data.get("last_sync")
                 saved_cfg = data.get("config", {})
-                self.config.update(saved_cfg)
+                # Solo persistimos preferencias no sensibles
+                for k in ("BASE_URL", "DESTINO"):
+                    if k in saved_cfg:
+                        self.config[k] = saved_cfg[k]
             except Exception:
                 self.last_sync = None
         else:
@@ -87,8 +109,6 @@ class SincronizadorApp(tk.Tk):
             "last_sync": self.last_sync,
             "config": {
                 "BASE_URL": self.var_url.get(),
-                "USUARIO":  self.var_user.get(),
-                "PASSWORD": self.var_pass.get(),
                 "DESTINO":  self.var_dest.get(),
             }
         }
@@ -228,6 +248,20 @@ class SincronizadorApp(tk.Tk):
             command=self._abrir_log_archivo,
             relief="flat",
         ).pack(side="left", padx=4)
+
+        self.btn_mercurio = tk.Button(
+            btn_frame,
+            text="  🌐  ABRIR MERCURIO",
+            font=("Consolas", 11, "bold"),
+            bg="#1A1F6E", fg="#A0AAFF",
+            activebackground="#2A2F8E",
+            activeforeground=TEXT_PRI,
+            bd=0, padx=18, pady=10,
+            cursor="hand2",
+            command=self._abrir_mercurio,
+            relief="flat",
+        )
+        self.btn_mercurio.pack(side="left", padx=8)
 
         # Progress bar
         self.progress = ttk.Progressbar(bottom, mode="indeterminate",
@@ -492,6 +526,83 @@ class SincronizadorApp(tk.Tk):
                 self.lbl_last_sync.config(text=self.last_sync)
         else:
             self.lbl_last_sync.config(text="Nunca")
+
+    # ── Acceso robótico a Mercurio ────────────────────────────────────────────
+    def _abrir_mercurio(self):
+        if not _PLAYWRIGHT_OK:
+            messagebox.showerror(
+                "Playwright no instalado",
+                "Instala Playwright primero:\n\n"
+                "  pip install playwright\n"
+                "  playwright install chromium"
+            )
+            return
+        if not MERCURIO_USUARIO or not MERCURIO_CLAVE:
+            messagebox.showerror(
+                "Credenciales Mercurio faltantes",
+                "Define MERCURIO_USER y MERCURIO_PASS en el entorno o en .env"
+            )
+            return
+        self.btn_mercurio.config(state="disabled", text="  ⏳  Abriendo…")
+        self._log("══════════════════════════════════════", "info")
+        self._log(" ACCESO ROBÓTICO A MERCURIO", "info")
+        self._log(f" URL: {MERCURIO_URL}", "dim")
+        self._log("══════════════════════════════════════", "info")
+        threading.Thread(target=self._run_mercurio, daemon=True).start()
+
+    def _run_mercurio(self):
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=False)
+                context = browser.new_context()
+                page    = context.new_page()
+
+                self.after(0, lambda: self._log("  Navegando a Mercurio…", "info"))
+                page.goto(MERCURIO_URL)
+                page.bring_to_front()
+                page.wait_for_selector("input", timeout=15000)
+
+                inputs = page.locator("input")
+                self.after(0, lambda: self._log(
+                    f"  Inputs detectados: {inputs.count()}", "dim"))
+
+                inputs.nth(0).fill(MERCURIO_USUARIO)
+                inputs.nth(1).fill(MERCURIO_CLAVE)
+                page.locator("input[value='Ingresar']").click()
+
+                page.wait_for_load_state("domcontentloaded", timeout=30000)
+                page.wait_for_selector("body", state="visible", timeout=30000)
+                page.bring_to_front()
+                page.wait_for_timeout(2000)
+
+                html  = page.content()
+                title = page.title()
+                url   = page.url
+
+                if "Login incorrecto" in html:
+                    self.after(0, lambda: self._log("  Login incorrecto", "err"))
+                    self.after(0, lambda: messagebox.showerror(
+                        "Mercurio", "Login incorrecto. Verifica las credenciales."))
+                    browser.close()
+                elif "Usuario Inactivo" in html:
+                    self.after(0, lambda: self._log("  Usuario inactivo", "warn"))
+                    self.after(0, lambda: messagebox.showwarning(
+                        "Mercurio", "El usuario está inactivo."))
+                    browser.close()
+                else:
+                    self.after(0, lambda: self._log(
+                        f"  Login exitoso — {title}", "ok"))
+                    self.after(0, lambda: self._log(f"  URL: {url}", "dim"))
+                    # El navegador permanece abierto para uso manual
+                    # No llamamos browser.close() — el usuario cierra cuando termine
+
+        except Exception as exc:
+            self.after(0, lambda: self._log(f"  ERROR Mercurio: {exc}", "err"))
+            self.after(0, lambda: messagebox.showerror(
+                "Mercurio", f"Error al abrir el navegador:\n{exc}"))
+        finally:
+            self.after(0, lambda: self.btn_mercurio.config(
+                state="normal", text="  🌐  ABRIR MERCURIO"))
 
     # ── Control de sincronización ─────────────────────────────────────────────
     def _start_sync(self):
