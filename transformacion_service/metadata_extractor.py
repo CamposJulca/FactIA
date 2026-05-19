@@ -402,6 +402,7 @@ import calendar
 from datetime import datetime
 
 from .metadata_writer import MetadataWriter
+from .config import REJECTED_FOLDER
 
 
 class InvoiceMetadataExtractor:
@@ -467,13 +468,23 @@ class InvoiceMetadataExtractor:
 
         logging.info("===== INICIANDO EXTRACCIÓN DE METADATA =====")
 
-        if not self.root_path.exists():
+        # 1. Facturas (Invoice)
+        if self.root_path.exists():
+            for xml_path in self.root_path.rglob("*.xml"):
+                self._process_file(xml_path, tipo="Invoice")
+        else:
             logging.error(f"Ruta no encontrada: {self.root_path}")
-            return
 
-        for xml_path in self.root_path.rglob("*.xml"):
+        # 2. Notas crédito (CreditNote)
+        credit_path = REJECTED_FOLDER / "CreditNote"
+        if credit_path.exists():
+            for xml_path in credit_path.rglob("*.xml"):
+                self._process_file(xml_path, tipo="CreditNote")
 
-            self._process_file(xml_path)
+        # 3. Documentos sin XML — registrar cada PDF
+        sinxml_path = REJECTED_FOLDER / "SinXML"
+        if sinxml_path.exists():
+            self._process_sinxml_folder(sinxml_path)
 
         self._save_results()
 
@@ -482,37 +493,38 @@ class InvoiceMetadataExtractor:
         logging.info(f"Errores: {self.errores}")
 
     # ==========================================================
-    # PROCESAMIENTO POR ARCHIVO
+    # PROCESAMIENTO POR ARCHIVO XML
     # ==========================================================
-    def _process_file(self, xml_path):
+    def _process_file(self, xml_path, tipo="Invoice"):
 
         try:
 
             tree = ET.parse(xml_path)
             root = tree.getroot()
 
-            invoice_root = self._resolve_invoice_root(root)
+            doc_root, detected_tipo = self._resolve_document_root(root, tipo)
 
-            if invoice_root is None:
+            if doc_root is None:
                 return
 
-            proveedor_nit = self._extract_supplier_nit(invoice_root)
+            proveedor_nit = self._extract_supplier_nit(doc_root)
 
-            numero_original = self._extract_invoice_number_original(invoice_root)
+            numero_original = self._extract_invoice_number_original(doc_root)
 
             numero_factura = re.sub(r"\D", "", numero_original)
 
             codigo = self._extract_codigo(numero_original)
 
-            iva = self._extract_iva(invoice_root)
+            iva = self._extract_iva(doc_root)
 
             fecha_emision = self._extract_fecha_emision(xml_path)
 
             fecha_vencimiento = self._last_day_month(fecha_emision)
 
-            observaciones = f"Factura {numero_factura} radicado ***"
+            tipo_label = "Nota Crédito" if detected_tipo == "CreditNote" else "Factura"
+            observaciones = f"{tipo_label} {numero_factura} radicado ***"
 
-            valor_factura = self._extract_valor_factura(invoice_root)
+            valor_factura = self._extract_valor_factura(doc_root)
 
             if not proveedor_nit or not numero_factura:
 
@@ -522,6 +534,7 @@ class InvoiceMetadataExtractor:
             self.total += 1
 
             metadata = {
+                "tipo_documento": detected_tipo,
                 "proveedor_nit": proveedor_nit,
                 "fecha_emision": fecha_emision,
                 "fecha_vencimiento": fecha_vencimiento,
@@ -553,22 +566,74 @@ class InvoiceMetadataExtractor:
             logging.error(f"ERROR procesando {xml_path}: {e}")
 
     # ==========================================================
-    # RESOLVER DOCUMENTO
+    # PROCESAMIENTO DOCUMENTOS SIN XML
     # ==========================================================
-    def _resolve_invoice_root(self, root):
+    def _process_sinxml_folder(self, sinxml_path):
+
+        for pdf_path in sinxml_path.rglob("*.pdf"):
+
+            if "__MACOSX" in str(pdf_path):
+                continue
+
+            self.total += 1
+            archivo = str(pdf_path)
+            # Usar el path relativo como número único para evitar colisiones
+            numero_factura = str(pdf_path.relative_to(sinxml_path))
+
+            metadata = {
+                "tipo_documento": "SinXML",
+                "proveedor_nit": "",
+                "fecha_emision": self._extract_fecha_emision(pdf_path),
+                "fecha_vencimiento": None,
+                "codigo": "",
+                "numero_factura": numero_factura,
+                "valor_factura": None,
+                "observaciones": f"Documento sin XML: {pdf_path.name}",
+                "iva_facturado_proveedor": "0",
+                "archivo": archivo,
+            }
+
+            logging.info(f"SinXML → {pdf_path.name}")
+            self.results.append(metadata)
+
+    # ==========================================================
+    # RESOLVER TIPO DE DOCUMENTO
+    # ==========================================================
+    def _resolve_document_root(self, root, expected_tipo):
 
         root_tag = self._strip_namespace(root.tag)
 
         if root_tag == "Invoice":
-            return root
+            return root, "Invoice"
+
+        if root_tag == "CreditNote":
+            return root, "CreditNote"
+
+        if root_tag == "DebitNote":
+            return root, "DebitNote"
 
         if root_tag == "AttachedDocument":
-            return self._extract_invoice_from_cdata(root)
+            for elem in root.iter():
+                if elem.text and "<Invoice" in elem.text:
+                    try:
+                        return ET.fromstring(elem.text.strip()), "Invoice"
+                    except Exception:
+                        return None, None
+                if elem.text and "<CreditNote" in elem.text:
+                    try:
+                        return ET.fromstring(elem.text.strip()), "CreditNote"
+                    except Exception:
+                        return None, None
 
-        return None
+        return None, None
+
+    # Alias para compatibilidad con código anterior
+    def _resolve_invoice_root(self, root):
+        doc_root, _ = self._resolve_document_root(root, "Invoice")
+        return doc_root
 
     # ==========================================================
-    # EXTRAER FACTURA DESDE ATTACHEDDOCUMENT
+    # EXTRAER FACTURA DESDE ATTACHEDDOCUMENT (legacy)
     # ==========================================================
     def _extract_invoice_from_cdata(self, root):
 
@@ -646,17 +711,33 @@ class InvoiceMetadataExtractor:
         return str(total)
 
     # ==========================================================
-    # FECHA EMISION (desde procesados.json)
+    # FECHA EMISION (desde procesados.json + fallback IssueDate)
     # ==========================================================
     def _extract_fecha_emision(self, xml_path):
 
-        carpeta = xml_path.parent.name
-        zip_name = f"{carpeta}.zip"
+        path = Path(xml_path)
 
-        fecha = self.fechas_recepcion.get(zip_name)
+        # 1) Lookup en procesados.json subiendo por la jerarquía de carpetas.
+        # Cubre el caso normal (XML directo bajo el ZIP del correo) y también
+        # casos donde el XML quedó dentro de subcarpetas creadas por extractall.
+        for ancestor in path.parents:
+            fecha = self.fechas_recepcion.get(f"{ancestor.name}.zip")
+            if fecha:
+                return fecha.split("T")[0]
 
-        if fecha:
-            return fecha.split("T")[0]
+        # 2) Fallback: leer cbc:IssueDate del propio XML.
+        # Necesario para XMLs que vienen en ZIPs anidados (AttachedDocument,
+        # facturas en sub-zips), cuyo nombre de carpeta no aparece como
+        # attachment en procesados.json.
+        try:
+            root = ET.parse(xml_path).getroot()
+            elem = root.find(".//cbc:IssueDate", self.namespaces)
+            if elem is not None and elem.text:
+                txt = elem.text.strip()
+                if len(txt) >= 10 and txt[4] == "-" and txt[7] == "-":
+                    return txt[:10]
+        except Exception:
+            pass
 
         return None
     
