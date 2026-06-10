@@ -3,7 +3,7 @@ from .auth import get_access_token
 from .graph_client import GraphClient
 from .downloader import Downloader
 
-def main(fecha_desde=None, fecha_hasta=None, abort_event=None):
+def main(fecha_desde=None, fecha_hasta=None, abort_event=None, pause_event=None):
 
     logger = setup_logger()
 
@@ -18,7 +18,7 @@ def main(fecha_desde=None, fecha_hasta=None, abort_event=None):
         refresh_token_fn=get_access_token,   # renueva automáticamente si el token expira
     )
 
-    downloader = Downloader(graph, logger, abort_event=abort_event)
+    downloader = Downloader(graph, logger, abort_event=abort_event, pause_event=pause_event)
 
     downloader.run()
 

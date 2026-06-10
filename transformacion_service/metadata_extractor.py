@@ -403,13 +403,16 @@ from datetime import datetime
 
 from .metadata_writer import MetadataWriter
 from .config import REJECTED_FOLDER
+from job_control import wait_if_paused
 
 
 class InvoiceMetadataExtractor:
 
-    def __init__(self, root_path):
+    def __init__(self, root_path, abort_event=None, pause_event=None):
 
         self.root_path = Path(root_path)
+        self.abort_event = abort_event
+        self.pause_event = pause_event
 
         self.namespaces = {
             "cbc": "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2",
@@ -471,6 +474,9 @@ class InvoiceMetadataExtractor:
         # 1. Facturas (Invoice)
         if self.root_path.exists():
             for xml_path in self.root_path.rglob("*.xml"):
+                if wait_if_paused(self.pause_event, self.abort_event):
+                    self._save_results()
+                    return
                 self._process_file(xml_path, tipo="Invoice")
         else:
             logging.error(f"Ruta no encontrada: {self.root_path}")
@@ -479,6 +485,9 @@ class InvoiceMetadataExtractor:
         credit_path = REJECTED_FOLDER / "CreditNote"
         if credit_path.exists():
             for xml_path in credit_path.rglob("*.xml"):
+                if wait_if_paused(self.pause_event, self.abort_event):
+                    self._save_results()
+                    return
                 self._process_file(xml_path, tipo="CreditNote")
 
         # 3. Documentos sin XML — registrar cada PDF
@@ -571,6 +580,9 @@ class InvoiceMetadataExtractor:
     def _process_sinxml_folder(self, sinxml_path):
 
         for pdf_path in sinxml_path.rglob("*.pdf"):
+
+            if wait_if_paused(self.pause_event, self.abort_event):
+                return
 
             if "__MACOSX" in str(pdf_path):
                 continue

@@ -84,12 +84,15 @@ import zipfile
 from pathlib import Path
 from .validator import DocumentValidator
 from .config import RAW_FOLDER, CURATED_FOLDER, REJECTED_FOLDER
+from job_control import wait_if_paused
 
 
 class ZipClassifier:
 
-    def __init__(self):
+    def __init__(self, abort_event=None, pause_event=None):
         self.validator = DocumentValidator()
+        self.abort_event = abort_event
+        self.pause_event = pause_event
 
         self.total = 0
         self.stats = {
@@ -111,6 +114,11 @@ class ZipClassifier:
         for root, _, files in os.walk(RAW_FOLDER):
 
             for file in files:
+
+                # Límite seguro entre ZIPs: pausa/aborta sin dejar uno a medias.
+                if wait_if_paused(self.pause_event, self.abort_event):
+                    self._print_summary()
+                    return
 
                 if file.lower().endswith(".zip"):
                     self.total += 1

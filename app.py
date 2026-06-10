@@ -30,6 +30,7 @@ sys.path.insert(0, '/app')
 from historico_service.main import main as _run_historico
 from transformacion_service.classifier import ZipClassifier
 from transformacion_service.metadata_extractor import InvoiceMetadataExtractor
+from job_control import wait_if_paused
 
 CURATED_FOLDER  = 'curado_2026/facturas'
 PROCESADOS_FILE = os.path.join(DATA_DIR, 'procesados.json')
@@ -43,6 +44,18 @@ app = Flask(__name__)
 
 # Evento de abort — compartido entre el endpoint /api/abort/ y los jobs en ejecución
 _abort_event = threading.Event()
+
+# Evento de pausa — compartido entre /api/pause/ /api/resume/ y los jobs.
+# Convención: SET = corriendo, CLEAR = pausado. Arranca en "corriendo".
+_pause_event = threading.Event()
+_pause_event.set()
+
+
+def _reset_control():
+    """Deja el control de jobs en estado limpio antes de iniciar uno nuevo:
+    sin abort pendiente y sin pausa pendiente (corriendo)."""
+    _abort_event.clear()
+    _pause_event.set()
 
 
 # ── Streaming helper ──────────────────────────────────────────────────────────
@@ -112,7 +125,13 @@ def _stream_job(fn, kwargs=None):
 # ── Wrappers que retornan dict ────────────────────────────────────────────────
 
 def _historico_con_conteo(fecha_desde=None, fecha_hasta=None):
-    _run_historico(fecha_desde=fecha_desde, fecha_hasta=fecha_hasta, abort_event=_abort_event)
+    _reset_control()
+    _run_historico(
+        fecha_desde=fecha_desde,
+        fecha_hasta=fecha_hasta,
+        abort_event=_abort_event,
+        pause_event=_pause_event,
+    )
     count = 0
     if os.path.exists(PROCESADOS_FILE):
         with open(PROCESADOS_FILE, 'r', encoding='utf-8') as f:
@@ -122,14 +141,18 @@ def _historico_con_conteo(fecha_desde=None, fecha_hasta=None):
 
 
 def _procesar_completo():
+    _reset_control()
+
     log.info('Iniciando clasificación de ZIPs...')
-    classifier = ZipClassifier()
+    classifier = ZipClassifier(abort_event=_abort_event, pause_event=_pause_event)
     classifier.process_all()
     stats = {'total_zips': classifier.total, **classifier.stats}
     log.info(f'Clasificación completada: {stats}')
 
     log.info('Iniciando extracción de metadata...')
-    extractor = InvoiceMetadataExtractor(CURATED_FOLDER)
+    extractor = InvoiceMetadataExtractor(
+        CURATED_FOLDER, abort_event=_abort_event, pause_event=_pause_event,
+    )
     extractor.process_all()
     log.info(f'Extracción completada: {extractor.total} facturas, {extractor.errores} errores')
 
@@ -138,8 +161,9 @@ def _procesar_completo():
         with open(FACTURAS_FILE, 'r', encoding='utf-8') as f:
             facturas = json.load(f)
 
+    aborted = _abort_event.is_set()
     return {
-        'status':        'ok',
+        'status':        'aborted' if aborted else 'ok',
         'clasificacion': stats,
         'facturas':      facturas,
         'total':         len(facturas),
@@ -153,8 +177,26 @@ def _procesar_completo():
 def abort_job():
     """Activa el evento de abort para detener el job en curso limpiamente."""
     _abort_event.set()
+    # Si estaba pausado, lo despausamos para que el hilo salga del wait y aborte.
+    _pause_event.set()
     log.warning('Abort solicitado por el usuario.')
     return jsonify({'status': 'abort_requested'})
+
+
+@app.route('/api/pause/', methods=['POST'])
+def pause_job():
+    """Pausa el job en curso en el próximo límite seguro entre documentos."""
+    _pause_event.clear()
+    log.warning('Pausa solicitada por el usuario.')
+    return jsonify({'status': 'paused'})
+
+
+@app.route('/api/resume/', methods=['POST'])
+def resume_job():
+    """Reanuda un job previamente pausado."""
+    _pause_event.set()
+    log.info('Reanudación solicitada por el usuario.')
+    return jsonify({'status': 'running'})
 
 
 @app.route('/api/descargar/', methods=['POST'])
@@ -192,8 +234,7 @@ def descargar_stream():
     fecha_desde = body.get('fecha_desde')
     fecha_hasta = body.get('fecha_hasta')
 
-    # Limpiar el evento de abort antes de iniciar
-    _abort_event.clear()
+    # El estado de control (abort/pausa) se resetea dentro de _historico_con_conteo.
 
     @stream_with_context
     def generate():

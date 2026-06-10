@@ -3,6 +3,7 @@ import time
 from .control import load_processed, save_processed
 from .storage import build_path
 from .extractor import extraer_zip
+from job_control import wait_if_paused
 
 # Pausa entre páginas para no saturar la API
 DELAY_ENTRE_PAGINAS = 0.5   # segundos
@@ -10,11 +11,12 @@ DELAY_ENTRE_PAGINAS = 0.5   # segundos
 
 class Downloader:
 
-    def __init__(self, graph_client, logger, abort_event=None):
+    def __init__(self, graph_client, logger, abort_event=None, pause_event=None):
         self.graph        = graph_client
         self.logger       = logger
         self.processed    = load_processed()
         self.abort_event  = abort_event
+        self.pause_event  = pause_event
         # Carpeta donde se extraen los ZIPs (env var o default junto a DATA_DIR)
         data_dir = os.getenv('FACTIA_DATA_DIR', '/data/factia')
         self.extraidos_dir = os.path.join(data_dir, 'extraidos')
@@ -29,7 +31,8 @@ class Downloader:
 
         while True:
 
-            if self.abort_event and self.abort_event.is_set():
+            # Límite seguro entre páginas: pausa aquí si se solicitó, aborta si toca.
+            if wait_if_paused(self.pause_event, self.abort_event, self.logger):
                 self.logger.warning(
                     f"Descarga abortada. Nuevos: {total_new} | Omitidos: {total_skip} | Errores: {total_error}"
                 )
@@ -57,7 +60,8 @@ class Downloader:
             # ── Procesar cada mensaje ─────────────────────────────────────
             for message in mensajes:
 
-                if self.abort_event and self.abort_event.is_set():
+                # Límite seguro entre documentos: ningún correo queda a medio radicar.
+                if wait_if_paused(self.pause_event, self.abort_event, self.logger):
                     self.logger.warning("Abort detectado — guardando progreso...")
                     save_processed(self.processed)
                     return
